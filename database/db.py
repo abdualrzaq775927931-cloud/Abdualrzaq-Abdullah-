@@ -1,94 +1,86 @@
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from config import DATABASE_URL
+from sqlalchemy import create_engine, Column, Integer, String, BigInteger, Boolean, DateTime, ForeignKey, Text, JSON
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
+from datetime import datetime
+import config
 
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
+Base = declarative_base()
+engine = create_engine(config.DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-# ---------- INIT DB ----------
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    tg_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String)
+    full_name = Column(String)
+    
+    # الصلاحيات والحالة
+    is_admin = Column(Boolean, default=False)
+    is_banned = Column(Boolean, default=False)
+    is_subscribed = Column(Boolean, default=False) # للاشتراك الإجباري
+    
+    # قيود النشر (Rate Control)
+    daily_post_limit = Column(Integer, default=10) # عدد المنشورات المسموحة يومياً
+    posts_today = Column(Integer, default=0)       # عداد المنشورات لليوم الحالي
+    last_post_date = Column(DateTime, default=datetime.utcnow)
+    
+    joined_at = Column(DateTime, default=datetime.utcnow)
+    
+    channels = relationship("Channel", back_populates="owner", cascade="all, delete-orphan")
+    queue_items = relationship("ContentQueue", back_populates="user")
+
+class Channel(Base):
+    __tablename__ = 'channels'
+    id = Column(Integer, primary_key=True)
+    channel_id = Column(BigInteger, unique=True, nullable=False)
+    title = Column(String)
+    owner_id = Column(BigInteger, ForeignKey('users.tg_id'))
+    
+    owner = relationship("User", back_populates="channels")
+
+class ContentQueue(Base):
+    __tablename__ = 'queue'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey('users.tg_id'))
+    target_channel_id = Column(BigInteger) # القناة المستهدفة للنشر
+    
+    # أنواع المحتوى
+    content_type = Column(String) # text, photo, video, audio, document, poll, quiz
+    text_content = Column(Text)
+    file_id = Column(String)      # لمعرفات الملفات في تليجرام
+    caption = Column(Text)        # الوصف المرافق للملفات
+    
+    # البيانات المتقدمة (Polls/Quizzes)
+    # نستخدم JSON لتخزين خيارات التصويت أو الأسئلة بشكل مرن
+    metadata_json = Column(JSON) 
+    
+    # الجدولة والحالة
+    scheduled_at = Column(DateTime, nullable=False)
+    priority = Column(Integer, default=0) # نظام الأولوية (Priority Queue)
+    status = Column(String, default="pending") # pending, posted, failed
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    user = relationship("User", back_populates="queue_items")
+
+# --- دوال الإدارة المباشرة (Helper Functions) ---
+
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    Base.metadata.create_all(engine)
 
-    # 👤 users
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        telegram_id BIGINT UNIQUE,
-        role TEXT DEFAULT 'user',
-        is_banned BOOLEAN DEFAULT FALSE,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
+def get_session():
+    return SessionLocal()
 
-    # 📢 channels
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS channels (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        channel_id BIGINT,
-        channel_name TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    # 📦 content
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS content (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        type TEXT,
-        media_type TEXT,
-        text TEXT,
-        file_id TEXT,
-        metadata JSONB,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    # 📊 queue
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS queue (
-        id SERIAL PRIMARY KEY,
-        user_id BIGINT,
-        content_id INT,
-        channel_id BIGINT,
-        scheduled_at TIMESTAMP,
-        status TEXT DEFAULT 'pending',
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-# ---------- USERS ----------
-def create_user(telegram_id):
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-    INSERT INTO users (telegram_id)
-    VALUES (%s)
-    ON CONFLICT (telegram_id) DO NOTHING
-    """, (telegram_id,))
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def get_user(telegram_id):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-
-    cur.execute("""
-    SELECT * FROM users WHERE telegram_id=%s
-    """, (telegram_id,))
-
-    user = cur.fetchone()
-
-    cur.close()
-    conn.close()
-
+# دالة سريعة للتحقق من المالك أو إضافة مستخدم جديد
+def get_or_create_user(tg_id, username=None, full_name=None):
+    session = get_session()
+    user = session.query(User).filter(User.tg_id == tg_id).first()
+    if not user:
+        # إذا كان هو المالك المحدد في config
+        is_admin = (tg_id == config.OWNER_ID)
+        user = User(tg_id=tg_id, username=username, full_name=full_name, is_admin=is_admin)
+        session.add(user)
+        session.commit()
+    session.close()
     return user
+    
